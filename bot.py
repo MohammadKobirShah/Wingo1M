@@ -1,11 +1,3 @@
-Perfect — let’s bake in the fix so you’ll never again run into that pesky **`Conflict: can't use getUpdates while webhook is active`** error.  
-I’ll give you the full, updated source code (with webhook deletion built in at startup), keeping all your original structure intact and also touching up the shutdown handling.
-
----
-
-## ✅ Full Updated Source Code
-
-```python
 #!/usr/bin/env python3
 """
 WinGo Prediction Bot - Aiogram 3.x
@@ -44,7 +36,7 @@ API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json
 DB_FILE = "win_go.db"
 HISTORY_PAGE_SIZE = 20
 HISTORY_WINDOW = 10
-POST_INTERVAL = 60          # seconds
+POST_INTERVAL = 60
 HEADER_TITLE = "[51GAME] k1Nɢ mAκεя"
 MAX_DISPLAY = 12
 
@@ -57,7 +49,7 @@ dp = Dispatcher()
 prediction_task: Optional[asyncio.Task] = None
 _cached_target_chat: Optional[int] = None
 
-# ---------- DB helpers (async) ----------
+# ---------- DB helpers ----------
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -353,10 +345,7 @@ async def handle_status(message: Message):
 async def main():
     await init_db()
     log.info("Bot is starting (Aiogram 3.x)")
-
-    # 🚀 Fix conflict error: ensure polling mode only
     await bot.delete_webhook(drop_pending_updates=True)
-
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
@@ -364,17 +353,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         log.info("Bot stopped manually.")
-```
-
----
-
-### 🔥 What Changed
-- Added `await bot.delete_webhook(drop_pending_updates=True)` in `main()` to **clear any previous webhook** config before polling starts.
-- Removed the “double-close session” hack at the end; Aiogram’s dispatcher will clean properly.
-- Added a **race guard** to avoid double-saving the same `next_issue`.
-
----
-
-Now when you start the bot, Telegram will treat it as **polling-only** and stop complaining about webhooks.  
-
-Your predictive fortune-teller bot should be happily chattering away in your group again.
