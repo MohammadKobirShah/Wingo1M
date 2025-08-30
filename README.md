@@ -49,8 +49,8 @@
 
 1. **Clone Repo**
    ```bash
-   git clone https://github.com/YOURUSERNAME/wingo-bot.git
-   cd wingo-bot
+   git clone https://github.com/MohammadKobirShah/Wingo1M.git
+   cd Wingo1M
    ```
 
 2. **Create Virtual Env**
