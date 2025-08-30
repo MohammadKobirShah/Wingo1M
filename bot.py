@@ -4,14 +4,14 @@
 
 Features:
 - Fetches WinGo history every minute ⏱
-- Predicts BIG / SMALL with confidence 👁
-- Multiplier adjusts with confidence 📈
-- Stores rounds & predictions in SQLite (aiosqlite) 🗄️
-- Automatically posts predictions in configured chat 🎯
-- Simple commands for admin control ⚙️
+- Predicts BIG/SMALL with confidence
+- Dynamic multiplier (reset on WIN, double on LOSS up to 81x)
+- Keeps only last 15 rounds & predictions in SQLite (aiosqlite) 🗄
+- Posts stylish prediction scoreboard with emojis 🎰
 """
 
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime
@@ -36,8 +36,8 @@ DB_FILE = "win_go.db"
 HISTORY_PAGE_SIZE = 20
 HISTORY_WINDOW = 10
 POST_INTERVAL = 60
-HEADER_TITLE = "[51GAME] k1Nɢ mAκεя"
-MAX_DISPLAY = 12
+HEADER_TITLE = "🌟 𝐊𝐎𝐁𝐈𝐑 ✦ 𝐖𝐈𝐍𝐆𝐎 𝟏𝐌 🌟"
+MAX_DISPLAY = 15
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("wingo_aiogram3")
@@ -79,6 +79,28 @@ async def init_db():
         await db.commit()
 
 
+async def prune_old_rounds(max_keep: int = 15):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            DELETE FROM rounds
+            WHERE issue NOT IN (
+                SELECT issue FROM rounds ORDER BY issue DESC LIMIT ?
+            )
+        """, (max_keep,))
+        await db.commit()
+
+
+async def prune_old_predictions(max_keep: int = 15):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            DELETE FROM predictions
+            WHERE issue NOT IN (
+                SELECT issue FROM predictions ORDER BY created_ts DESC LIMIT ?
+            )
+        """, (max_keep,))
+        await db.commit()
+
+
 async def db_set_config(key: str, value: str):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT OR REPLACE INTO config(k,v) VALUES (?,?)", (key, value))
@@ -105,6 +127,7 @@ async def store_rounds_async(rounds: List[Dict]):
             except Exception:
                 log.exception("Error inserting round %s", r)
         await db.commit()
+    await prune_old_rounds(15)
 
 
 async def get_all_rounds() -> List[Tuple[str, int]]:
@@ -121,6 +144,7 @@ async def save_prediction_async(issue: str, predicted: str, confidence: float, m
             (issue, predicted, confidence, multiplier, datetime.utcnow().isoformat())
         )
         await db.commit()
+    await prune_old_predictions(15)
 
 
 async def update_prediction_result_async(issue: str, result: str):
@@ -137,7 +161,11 @@ async def get_prediction_by_issue(issue: str):
 
 async def get_last_prediction():
     async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT issue, predicted, multiplier FROM predictions ORDER BY created_ts DESC LIMIT 1")
+        cur = await db.execute("""
+            SELECT issue, predicted, multiplier, result
+            FROM predictions
+            ORDER BY created_ts DESC LIMIT 1
+        """)
         return await cur.fetchone()
 
 
@@ -145,12 +173,13 @@ async def get_last_prediction():
 async def fetch_history(session: aiohttp.ClientSession, page_size: int = HISTORY_PAGE_SIZE) -> List[Dict]:
     try:
         params = {"pageNo": 1, "pageSize": page_size}
-        async with session.get(API_URL, params=params, timeout=20) as resp:
-            resp.raise_for_status()
-            js = await resp.json()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(API_URL, params=params, headers=headers, timeout=20) as resp:
+            raw = await resp.text()  # force parse as text
+            js = json.loads(raw)
             items = js.get("data", {}).get("list", [])
             normalized = []
-            for item in reversed(items):  # oldest-first
+            for item in reversed(items):  # oldest first
                 issue = str(item.get("issueNumber"))
                 number = int(item.get("number", 0))
                 color = item.get("color", "")
@@ -161,8 +190,8 @@ async def fetch_history(session: aiohttp.ClientSession, page_size: int = HISTORY
                     "ts": datetime.utcnow().isoformat()
                 })
             return normalized
-    except Exception:
-        log.exception("fetch_history error")
+    except Exception as e:
+        log.error(f"❌ fetch_history error: {e}")
         return []
 
 
@@ -171,22 +200,13 @@ def label_big_small(number: int) -> str:
     return "BIG" if number >= 5 else "SMALL"
 
 
-def confidence_to_multiplier(conf: float) -> int:
-    if conf >= 0.95: return 81
-    if conf >= 0.85: return 27
-    if conf >= 0.75: return 9
-    if conf >= 0.65: return 5
-    if conf >= 0.6: return 3
-    if conf >= 0.55: return 2
-    return 1
-
-
 async def predict_next_from_db() -> Tuple[str, str, float, int]:
     rows = await get_all_rounds()
     history = [{"issue": r[0], "number": r[1]} for r in rows]
     if not history:
         return ("0", "BIG", 0.6, 1)
 
+    # Simple trend prediction
     window = history[-HISTORY_WINDOW:] if len(history) >= HISTORY_WINDOW else history
     big_count = sum(1 for r in window if label_big_small(r["number"]) == "BIG")
     small_count = len(window) - big_count
@@ -204,7 +224,20 @@ async def predict_next_from_db() -> Tuple[str, str, float, int]:
     except Exception:
         next_issue = last_issue + "-n"
 
-    multiplier = confidence_to_multiplier(conf)
+    # Dynamic multiplier strategy
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute("SELECT result, multiplier FROM predictions ORDER BY created_ts DESC LIMIT 1")
+        last = await cur.fetchone()
+
+    if last:
+        last_result, last_mult = last[0], last[1]
+        if last_result == "WIN":
+            multiplier = 1
+        else:
+            multiplier = min(last_mult * 2, 81)  # martingale doubling
+    else:
+        multiplier = 1
+
     return next_issue, pred, round(conf, 3), multiplier
 
 
@@ -226,27 +259,38 @@ async def build_message_text(display_count: int = MAX_DISPLAY) -> Tuple[str, str
         return ("❌ No results yet.", "")
 
     recent = rows[-display_count:]
-    lines = ["🎰 <b>Recent Rounds</b>\n"]
+    lines = ["📜 <b>Recent Rounds (Last 15)</b>\n━━━━━━━━━━━━━━━━━━━━━━━"]
     for r in recent:
         issue, num = r[0], r[1]
         label = label_big_small(num)
         pr = await get_prediction_by_issue(issue)
         if pr:
-            predicted, mult, result = pr
-            outcome = "✅ WIN" if result == "WIN" else "❌ LOSS" if result else "⏳ Pending"
+            _, _, result = pr
+            outcome = "✅ WIN" if result == "WIN" else "❌ LOSS" if result else "⏳ Waiting"
         else:
-            outcome = "⏳ Pending"
-        lines.append(f"<code>{issue[-3:]}</code> → 🎲 {num} → {label:<5} | {outcome}")
+            outcome = "⏳ Waiting"
+        lines.append(f"🎲 <code>{issue[-3:]}</code> → {num} ({label}) | {outcome}")
 
     last_pred = await get_last_prediction()
     if last_pred:
-        next_issue, next_predicted, mult = last_pred
+        next_issue, next_predicted, mult, _ = last_pred
     else:
         next_issue, next_predicted, mult = "???", "BIG", 1
 
-    header = f"🎯 <b>{HEADER_TITLE}</b>\n🔥 PRIME PREDICTIONS 🔥\n\n"
+    header = (
+        f"🔥 <b>{HEADER_TITLE}</b> 🔥\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <b>Prime Predictions</b>\n"
+    )
     body = "\n".join(lines)
-    footer = f"\n\n➡️ <b>Next Bet:</b> <code>{next_issue[-3:]}</code> → {next_predicted} ({mult}x)"
+    footer = (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Next Trade:</b> <code>{next_issue[-3:]}</code>\n"
+        f"🔮 Prediction: <b>{next_predicted}</b>\n"
+        f"💸 Multiplier: <b>{mult}x</b>\n"
+        f"⏱ Updates every {POST_INTERVAL}s\n\n"
+        f"⚠️ <b>🇵‌🇱‌🇦‌🇾‌ 🇦‌🇹‌ 🇴‌🇼‌🇳‌ 🇷‌🇮‌🇸‌🇰‌</b> 🎲"
+    )
     return header + body + footer, next_issue
 
 
@@ -273,15 +317,15 @@ async def prediction_worker(chat_id: int):
                 text, posted_issue = await build_message_text()
                 try:
                     await bot.send_message(chat_id, text)
-                    log.info("Posted to chat %s (pred_issue=%s)", chat_id, posted_issue)
-                except Exception:
-                    log.exception("Failed to post to chat %s", chat_id)
+                    log.info(f"✅ Posted prediction to {chat_id} (pred_issue={posted_issue})")
+                except Exception as e:
+                    log.error(f"❌ Failed to post to {chat_id}: {e}")
 
             except asyncio.CancelledError:
                 log.info("Prediction worker cancelled")
                 break
-            except Exception:
-                log.exception("Unhandled error in prediction worker")
+            except Exception as e:
+                log.error(f"Unhandled error in worker: {e}")
             await asyncio.sleep(POST_INTERVAL)
 
 
@@ -291,12 +335,13 @@ async def handle_start(message: Message):
     start_text = (
         "👋 <b>Welcome to WinGo Prediction Bot</b>\n\n"
         "📊 <b>Features:</b>\n"
-        "• Auto-fetches WinGo results every minute\n"
+        "• Auto-fetches results every 60s\n"
         "• Predicts <b>BIG / SMALL</b> with confidence 📈\n"
-        "• Stores history locally 🗄️\n"
-        "• Posts predictions to your channel/group 🎯\n\n"
+        "• Dynamic multiplier: WIN → reset, LOSS → double\n"
+        "• Keeps only last 15 trades 🗄️\n"
+        "• Posts automated predictions 🎯\n\n"
         "⚙️ <b>Commands:</b>\n"
-        "▫️ /SetTarget <chat_id> → Save target chat\n"
+        "▫️ /SetTarget <code>chat_id</code> → Save target chat\n"
         "▫️ /StartPrediction → Begin posting\n"
         "▫️ /StopPrediction → Stop predictions\n"
         "▫️ /Status → Show current status\n"
@@ -310,16 +355,14 @@ async def handle_set_target(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.reply("❌ Not authorized")
         return
-
     args = message.text.strip().split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("Usage: /SetTarget <chat_id_or_channel_username>")
+        await message.reply("Usage: /SetTarget <code>chat_id_or_channel_username</code>")
         return
-
     target = args[1].strip()
     await db_set_config("target_chat", target)
     _cached_target_chat = None
-    await message.reply(f"🎯 Target saved:\n<b>{target}</b>\n\nRun <b>/StartPrediction</b> to begin!")
+    await message.reply(f"🎯 Target saved:\n<code>{target}</code>\n\nRun <b>/StartPrediction</b> to begin!")
 
 
 @dp.message(Command(commands=["StartPrediction"]))
@@ -328,21 +371,15 @@ async def handle_start_prediction(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.reply("❌ Not authorized")
         return
-
     target = await db_get_config("target_chat")
     chat_id = int(target) if target and target.isdigit() else (target or message.chat.id)
-
     await db_set_config("target_chat", str(chat_id))
     _cached_target_chat = chat_id
-
     if prediction_task and not prediction_task.done():
         await message.reply("⚠️ Prediction already running!")
         return
-
     prediction_task = asyncio.create_task(prediction_worker(chat_id))
-    await message.reply(
-        f"🚀 Prediction started!\n\n📌 Posting to: <b>{chat_id}</b>\n⏱ Interval: {POST_INTERVAL}s"
-    )
+    await message.reply(f"🚀 Prediction started!\n📌 Posting to: <code>{chat_id}</code>\n⏱ Interval: {POST_INTERVAL}s")
 
 
 @dp.message(Command(commands=["StopPrediction"]))
@@ -351,7 +388,6 @@ async def handle_stop_prediction(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.reply("❌ Not authorized")
         return
-
     if prediction_task and not prediction_task.done():
         prediction_task.cancel()
         try:
@@ -368,7 +404,7 @@ async def handle_stop_prediction(message: Message):
 async def handle_status(message: Message):
     running = "🟢 <b>Running</b>" if prediction_task and not prediction_task.done() else "🔴 <b>Stopped</b>"
     target = await db_get_config("target_chat") or "❌ Not set"
-    await message.reply(f"⚙️ <b>Status Report</b>\n\n{running}\n🎯 Target: <b>{target}</b>")
+    await message.reply(f"⚙️ <b>Status Report</b>\n\n{running}\n🎯 Target: <code>{target}</code>")
 
 
 # ---------- Entry ----------
@@ -382,5 +418,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except(KeyboardInterrupt, SystemExit):
         log.info("Bot stopped manually.")
