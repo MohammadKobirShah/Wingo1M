@@ -32,5 +32,5 @@ A Telegram bot that:
 
 1. Clone project:
 ```bash
-git clone https://github.com/YOURUSERNAME/wingo-bot.git
-cd wingo-bot
+git clone https://github.com/MohammadKobirShah/Wingo1M.git
+cd Wingo1M
